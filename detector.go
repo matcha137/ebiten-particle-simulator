@@ -32,6 +32,12 @@ const (
 
 type Vec2 struct{ X, Y float64 }
 
+// bendRadius は横運動量 pt [GeV] の荷電粒子がソレノイド磁場 B [T] 中で描く
+// 円弧の半径 [m]。1/R = 0.3 q B / pT は厳密な関係式。
+func bendRadius(pt, q, B float64) float64 {
+	return pt / (0.299792458 * math.Abs(q) * B)
+}
+
 // TrackPath は原点から出た荷電粒子の円弧を返す（半径 rStop まで、または反転点まで）。
 func TrackPath(p P4, q, B, rStop float64) []Vec2 {
 	pt := p.Pt()
@@ -44,7 +50,7 @@ func TrackPath(p P4, q, B, rStop float64) []Vec2 {
 		return []Vec2{{0, 0}, {vx * rStop, vy * rStop}}
 	}
 
-	R := pt / (0.299792458 * math.Abs(q) * B) // [m]
+	R := bendRadius(pt, q, B)
 	sgn := math.Copysign(1, q*B)
 
 	// 中心は向心力の向き: q*(v x B)
@@ -81,7 +87,7 @@ func ImpactPhi(p P4, q, B float64) (float64, bool) {
 	if q == 0 || B == 0 {
 		return p.Phi(), true
 	}
-	R := pt / (0.299792458 * math.Abs(q) * B)
+	R := bendRadius(pt, q, B)
 	if 2*R < REcalIn {
 		return 0, false // 内部トラッカー内でループして到達しない
 	}
@@ -89,6 +95,27 @@ func ImpactPhi(p P4, q, B float64) (float64, bool) {
 	alpha := 2 * math.Asin(REcalIn/(2*R))
 	sgn := math.Copysign(1, q*B)
 	return p.Phi() - sgn*alpha/2, true
+}
+
+// ReachesTracker は荷電粒子が内部トラッカーにヒットを残すかを返す。
+// 円弧の最大到達半径は 2R なので、2R > RTrkIn が幾何学的な最低条件。
+// カロリメータに届かずにループで落ちる粒子でも、トラッカー内では飛跡になる
+// （この判定を ImpactPhi と共有してはいけない）。
+//
+// 【近似】実験が課す最小ヒット数の要求は入れていないので、最内層をかすめる
+// だけの飛跡も 1 本と数える。飛跡多重度は数割の過大評価になりうる。
+func ReachesTracker(p P4, q, B float64) bool {
+	if q == 0 {
+		return false
+	}
+	pt := p.Pt()
+	if pt < 1e-6 {
+		return false
+	}
+	if B == 0 {
+		return true
+	}
+	return 2*bendRadius(pt, q, B) > RTrkIn
 }
 
 // ============================================================================
@@ -161,15 +188,13 @@ type Reco struct {
 	TruthMET float64
 }
 
+// phiBin は方位角をタワー番号に落とす。
+// ImpactPhi は磁場による曲がりを phi に足し引きするため [-pi, pi] を
+// はみ出した値を返しうる。クランプすると bin 0 / 71 に偽のホットタワーが
+// 立つので、2pi で折り返す。
 func phiBin(phi float64) int {
 	b := int(math.Floor((phi + math.Pi) / (2 * math.Pi) * NPhiTowers))
-	if b < 0 {
-		b = 0
-	}
-	if b >= NPhiTowers {
-		b = NPhiTowers - 1
-	}
-	return b
+	return ((b % NPhiTowers) + NPhiTowers) % NPhiTowers
 }
 
 // Reconstruct は真の粒子リストから検出器応答と再構成量を計算する。
@@ -185,6 +210,11 @@ func Reconstruct(ev Event, B float64) *Reco {
 			continue
 		}
 
+		// --- 飛跡カウント: 内部トラッカーで完結するのでカロリメータ到達とは独立 ---
+		if p.Charge != 0 && p.P.Pt() > 0.4 && ReachesTracker(p.P, p.Charge, B) {
+			r.NTracks++
+		}
+
 		// --- カロリメータへの到達判定（磁場でループする粒子は落ちる） ---
 		iphi, reach := ImpactPhi(p.P, p.Charge, B)
 		if !reach {
@@ -198,10 +228,6 @@ func Reconstruct(ev Event, B float64) *Reco {
 		b := phiBin(iphi)
 		r.Towers.Ecal[b] += smear(emEt, ecalRes(em))
 		r.Towers.Hcal[b] += smear(hadEt, hcalRes(had))
-
-		if p.Charge != 0 && p.P.Pt() > 0.4 {
-			r.NTracks++
-		}
 
 		// --- オブジェクト再構成 ---
 		switch p.Kind {
